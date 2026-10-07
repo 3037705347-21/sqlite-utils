@@ -30,6 +30,7 @@ from sqlite_utils.db import (
     NoTable,
     NoView,
     PrimaryKeyRequired,
+    ReconcileConflict,
     quote_identifier,
 )
 from sqlite_utils.plugins import ensure_plugins_loaded, get_plugins, pm
@@ -2868,6 +2869,71 @@ def extract(
     try:
         db.table(table).extract(**kwargs)
     except (NoTable, InvalidColumns) as e:
+        raise click.ClickException(str(e))
+
+
+@cli.command()
+@click.argument(
+    "path",
+    type=click.Path(file_okay=True, dir_okay=False, allow_dash=False),
+    required=True,
+)
+@click.argument("table")
+@click.argument("columns", nargs=-1, required=True)
+@click.option(
+    "--table", "other_table", help="Name of the lookup table to reconcile against"
+)
+@click.option("--fk-column", help="Name of the foreign key column in the table")
+@click.option(
+    "--rename",
+    type=(str, str),
+    multiple=True,
+    help="Rename this column in the lookup table",
+)
+@click.option(
+    "--rename-value",
+    type=(str, str),
+    multiple=True,
+    help="Treat an old value as renamed to a new value, e.g. --rename-value Fish Seafood",
+)
+@click.option(
+    "--delete-value",
+    multiple=True,
+    help="Treat an old value as deleted, e.g. --delete-value Fish",
+)
+@load_extension_option
+def reconcile(
+    path,
+    table,
+    columns,
+    other_table,
+    fk_column,
+    rename,
+    rename_value,
+    delete_value,
+    load_extension,
+):
+    """Reconcile an extracted lookup table against current column values
+
+    Example:
+
+    \b
+        sqlite-utils reconcile trees.db Street_Trees Species
+    """
+    db = sqlite_utils.Database(path)
+    _register_db_for_cleanup(db)
+    _load_extensions(db, load_extension)
+    kwargs: dict[str, Any] = {
+        "columns": columns,
+        "table": other_table,
+        "fk_column": fk_column,
+        "rename": dict(rename),
+        "renames": dict(rename_value),
+        "deletes": list(delete_value),
+    }
+    try:
+        db.table(table).reconcile(**kwargs)
+    except (NoTable, InvalidColumns, ReconcileConflict) as e:
         raise click.ClickException(str(e))
 
 

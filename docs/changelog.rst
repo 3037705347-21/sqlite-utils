@@ -4,6 +4,13 @@
  Changelog
 ===========
 
+.. _v4_3:
+
+4.3 (unreleased)
+----------------
+
+- New ``table.reconcile()`` method and ``sqlite-utils reconcile`` command for repeatedly reconciling a lookup table created by ``table.extract()`` against the current source values. Renamed values keep their existing IDs so foreign key references follow them, new values are inserted and repointed to, managed values that disappeared are deleted, manually added lookup rows are preserved, and ambiguous changes raise ``ReconcileConflict`` and leave the database untouched. Ambiguity can be resolved with ``renames=``/``deletes=`` (``--rename-value``/``--delete-value``).
+
 .. _v4_2_1:
 
 4.2.1 (2026-08-13)

@@ -2490,6 +2490,42 @@ After running the above, the command ``sqlite-utils schema global.db`` reveals t
 .. note::
     In Python: :ref:`table.extract() <python_api_extract>`  CLI reference: :ref:`sqlite-utils extract <cli_ref_extract>`
 
+.. _cli_reconcile:
+
+Reconciling an extracted lookup table
+=====================================
+
+The ``sqlite-utils reconcile`` command updates a lookup table previously created by ``sqlite-utils extract`` to match the current values of the source columns. It reuses existing lookup table IDs, adds new values, treats a value that disappeared and a value that appeared as a rename when the mapping is unique, and deletes values that are no longer managed. Rows you added to the lookup table manually are left untouched.
+
+See :ref:`python_api_reconcile` for full details of how reconciliation works. The columns must currently exist on the table - a common workflow is to re-import the source data with ``--alter`` first:
+
+.. code-block:: bash
+
+    sqlite-utils upsert my.db trees trees.csv --csv --pk id --alter
+    sqlite-utils reconcile my.db trees species
+
+The command takes the following options:
+
+``--table TEXT``
+    The name of the lookup table to reconcile against. Defaults to the name of the column.
+
+``--fk-column TEXT``
+    The name of the foreign key column on the table. Defaults to ``tablename_id``.
+
+``--rename <TEXT TEXT>``
+    Rename a source column in the lookup table, matching ``sqlite-utils extract --rename``.
+
+``--rename-value <TEXT TEXT>``
+    Declare that an old value was renamed to a new one, for example ``--rename-value Fish Seafood``. Can be used multiple times.
+
+``--delete-value TEXT``
+    Declare that an old value was deleted rather than renamed, for example ``--delete-value Fish``. Can be used multiple times.
+
+If the relationship between disappeared values and new values cannot be determined uniquely - and no ``--rename-value`` or ``--delete-value`` options resolve it - the command exits with an error and leaves the database unchanged. The same happens if a value due to be deleted is still referenced by rows in another table.
+
+.. note::
+    In Python: :ref:`table.reconcile() <python_api_reconcile>`
+
 .. _cli_create_view:
 
 Creating views

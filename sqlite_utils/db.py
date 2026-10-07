@@ -464,6 +464,10 @@ class InvalidColumns(Exception):
     "Specified columns do not exist"
 
 
+class ReconcileConflict(Exception):
+    "Lookup table cannot be reconciled without making an ambiguous decision"
+
+
 class TransactionError(Exception):
     "Operation cannot be performed while a transaction is open"
 
@@ -3384,6 +3388,454 @@ class Table(Queryable):
 
             # And add the foreign key constraint
             self.add_foreign_key(fk_column, table, "id")
+        return self
+
+    def reconcile(
+        self,
+        columns: str | Iterable[str],
+        table: str | None = None,
+        fk_column: str | None = None,
+        rename: dict[str, str] | None = None,
+        renames: dict[Any, Any] | None = None,
+        deletes: Iterable[Any] | None = None,
+    ) -> "Table":
+        """
+        Reconcile a lookup table that was previously created by
+        :meth:`extract` against the current values in this table.
+
+        The source columns must currently exist on this table - a common
+        workflow is to re-import the source data (including the raw value
+        columns) with ``alter=True`` and then call this method. Existing
+        lookup table IDs are reused: a value that was renamed keeps its ID
+        (so every foreign key reference follows the rename), new values are
+        inserted and repointed to, and values that are no longer present are
+        deleted - but only if they were previously managed here. Rows added
+        to the lookup table manually are left alone as long as this table
+        does not reference them.
+
+        If exactly one managed value disappeared and exactly one new value
+        appeared the change is treated as a rename. Any other mapping is
+        ambiguous and raises :class:`ReconcileConflict`; pass explicit
+        ``renames=`` and ``deletes=`` to resolve it. If the new value already
+        exists on an unmanaged row this table points to (for example a row
+        created by a later import using ``extracts=``), that row is merged
+        into the original managed ID. The same :class:`ReconcileConflict` is
+        raised if a row due to be deleted is still referenced from another
+        table. Every check and write runs in a single transaction, so a
+        conflict leaves the database untouched.
+
+        See :ref:`python_api_reconcile` for details.
+
+        :param columns: Single column or list of columns holding the current raw values
+        :param table: Name of the existing extracted lookup table
+        :param fk_column: Name of the foreign key column in this table
+        :param rename: Dictionary of source columns renamed in the lookup table, as used by :meth:`extract`
+        :param renames: Explicit value renames as ``{old_value: new_value}`` (use tuples for multiple columns)
+        :param deletes: Managed values that should be deleted rather than treated as renames
+        """
+        rename = rename or {}
+        renames = renames or {}
+        deletes = list(deletes or [])
+        if isinstance(columns, str):
+            columns = [columns]
+        columns = [resolve_casing(c, self.columns_dict) for c in columns]
+        rename = {
+            resolve_casing(k, self.columns_dict): v for k, v in rename.items()
+        }
+        if not set(columns).issubset(self.columns_dict.keys()):
+            raise InvalidColumns(
+                f"Invalid columns {columns} for table with columns {list(self.columns_dict.keys())}"
+            )
+        table = table or "_".join(columns)
+        fk_column = fk_column or f"{table}_id"
+        lookup_table = self.db.table(table)
+        if not lookup_table.exists():
+            raise NoTable(
+                f"Lookup table {table} does not exist - use .extract() first"
+            )
+        lookup_columns = [(rename.get(col) or col) for col in columns]
+        if "id" not in lookup_table.columns_dict or any(
+            col not in lookup_table.columns_dict for col in lookup_columns
+        ):
+            raise InvalidColumns(
+                f"Lookup table {table} does not have columns {['id', *lookup_columns]}"
+            )
+        if fk_column not in self.columns_dict:
+            raise InvalidColumns(
+                f"Foreign key column {fk_column} does not exist on table {self.name} - use .extract() first"
+            )
+
+        def as_tuple(value: Any) -> tuple:
+            if isinstance(value, (list, tuple)):
+                return tuple(value)
+            return (value,)
+
+        def fmt(value_tuple: tuple) -> str:
+            if len(value_tuple) == 1:
+                return repr(value_tuple[0])
+            return repr(value_tuple)
+
+        with self.db.atomic():
+            # Bookkeeping tables recording which lookup tables have ever
+            # been reconciled and which of their rows are managed here (as
+            # opposed to added manually). The marker survives even when all
+            # managed rows have been deleted, so manual rows are never
+            # re-adopted as a fresh baseline.
+            self.db.execute(
+                'CREATE TABLE IF NOT EXISTS "_sqlite_utils_extract_lookups" ('
+                '"lookup_table" TEXT PRIMARY KEY)'
+            )
+            self.db.execute(
+                'CREATE TABLE IF NOT EXISTS "_sqlite_utils_extract_rows" ('
+                '"lookup_table" TEXT NOT NULL, '
+                '"lookup_id" INTEGER NOT NULL, '
+                'PRIMARY KEY ("lookup_table", "lookup_id")) WITHOUT ROWID'
+            )
+
+            all_columns_are_null = " AND ".join(
+                f"{quote_identifier(c)} IS NULL" for c in columns
+            )
+
+            # The set of values the source data currently wants
+            desired_rows = self.db.execute(
+                "SELECT DISTINCT {cols} FROM {self_name} WHERE NOT ({all_null})".format(
+                    cols=", ".join(quote_identifier(c) for c in columns),
+                    self_name=quote_identifier(self.name),
+                    all_null=all_columns_are_null,
+                )
+            ).fetchall()
+            desired = {tuple(row) for row in desired_rows}
+
+            # Everything currently in the lookup table
+            existing_rows = self.db.execute(
+                "SELECT id, {cols} FROM {lookup}".format(
+                    cols=", ".join(quote_identifier(c) for c in lookup_columns),
+                    lookup=quote_identifier(table),
+                )
+            ).fetchall()
+            id_to_value: dict[Any, tuple] = {
+                row[0]: tuple(row[1:]) for row in existing_rows
+            }
+            value_to_ids: dict[tuple, list[Any]] = {}
+            for row_id, value in id_to_value.items():
+                value_to_ids.setdefault(value, []).append(row_id)
+
+            # A desired value matching more than one lookup row cannot be
+            # assigned a unique identity
+            for value in desired:
+                matching = value_to_ids.get(value, [])
+                if len(matching) > 1:
+                    raise ReconcileConflict(
+                        f"Lookup table {table} has {len(matching)} rows matching "
+                        f"value {fmt(value)} with IDs {matching}; cannot assign a unique identity"
+                    )
+
+            # Rows managed by reconciliation. On the first run for a lookup
+            # table there is no registry yet, so the managed baseline is the
+            # set of lookup rows this table's foreign key currently points
+            # at: those are the rows produced by the original extraction.
+            # Unreferenced rows are treated as manually maintained.
+            managed_result = self.db.execute(
+                'SELECT lookup_id FROM "_sqlite_utils_extract_rows" WHERE lookup_table = ?',
+                [table],
+            ).fetchall()
+            marker = self.db.execute(
+                'SELECT 1 FROM "_sqlite_utils_extract_lookups" WHERE lookup_table = ?',
+                [table],
+            ).fetchone()
+            if marker is None:
+                # First reconciliation for this lookup table: the managed
+                # baseline is the set of lookup rows this table's foreign key
+                # currently points at - the rows produced by the original
+                # extraction. Unreferenced rows are treated as manual.
+                referenced_result = self.db.execute(
+                    f"SELECT DISTINCT {quote_identifier(fk_column)} "
+                    f"FROM {quote_identifier(self.name)} "
+                    f"WHERE {quote_identifier(fk_column)} IS NOT NULL"
+                ).fetchall()
+                managed_ids = {row[0] for row in referenced_result}
+            else:
+                managed_ids = {row[0] for row in managed_result}
+            managed_value_to_ids: dict[tuple, list[Any]] = {}
+            for row_id in managed_ids:
+                if row_id in id_to_value:
+                    managed_value_to_ids.setdefault(id_to_value[row_id], []).append(
+                        row_id
+                    )
+
+            # Compare against the values currently carried by *managed*
+            # identities, so a value that exists on an unmanaged (e.g.
+            # freshly inserted) row can still reuse a disappearing identity
+            # by merging that row into it
+            present_values = set(id_to_value.values())
+            managed_values = set(managed_value_to_ids)
+            removed_values = managed_values - desired
+
+            # Unmanaged rows this table's foreign key already points at are
+            # merge candidates: these are duplicate identities created by a
+            # later import (e.g. upsert with extracts=). An unmanaged row
+            # that is NOT referenced is a manual row and stays out of the
+            # change calculation even if the source now uses its value
+            currently_referenced = {
+                row[0]
+                for row in self.db.execute(
+                    f"SELECT DISTINCT {quote_identifier(fk_column)} "
+                    f"FROM {quote_identifier(self.name)} "
+                    f"WHERE {quote_identifier(fk_column)} IS NOT NULL"
+                ).fetchall()
+            }
+            merge_candidate_values = {
+                value
+                for row_id, value in id_to_value.items()
+                if row_id in currently_referenced
+                and row_id not in managed_ids
+                and value in desired
+            }
+            added_values = (desired - present_values) | merge_candidate_values
+            # Explicit hints may target any value no managed identity
+            # carries, including one living on a manual row
+            hintable_values = desired - managed_values
+
+            # Explicit rename hints take precedence and must be unambiguous
+            # themselves: the old value must be one that disappeared and the
+            # new value one that no managed identity carries yet
+            explicit_renames: dict[tuple, tuple] = {}
+            for old_raw, new_raw in renames.items():
+                old_value = as_tuple(old_raw)
+                new_value = as_tuple(new_raw)
+                if len(old_value) != len(columns) or len(new_value) != len(columns):
+                    raise ReconcileConflict(
+                        f"Rename {old_raw!r} -> {new_raw!r} must use {len(columns)} value(s)"
+                    )
+                if old_value not in removed_values:
+                    raise ReconcileConflict(
+                        f"Cannot rename {fmt(old_value)}: it is not a managed value that disappeared"
+                    )
+                if new_value not in hintable_values:
+                    raise ReconcileConflict(
+                        f"Cannot rename {fmt(old_value)} to {fmt(new_value)}: that value already exists"
+                    )
+                if new_value in explicit_renames.values():
+                    raise ReconcileConflict(
+                        f"Two renames target the same new value {fmt(new_value)}"
+                    )
+                explicit_renames[old_value] = new_value
+
+            # Explicit deletions: managed values that really were retired,
+            # rather than renamed
+            explicit_deletes: set[tuple] = set()
+            for raw in deletes:
+                value = as_tuple(raw)
+                if len(value) != len(columns):
+                    raise ReconcileConflict(
+                        f"Deleted value {raw!r} must use {len(columns)} value(s)"
+                    )
+                if value not in removed_values:
+                    raise ReconcileConflict(
+                        f"Cannot delete {fmt(value)}: it is not a managed value that disappeared"
+                    )
+                if value in explicit_renames:
+                    raise ReconcileConflict(
+                        f"{fmt(value)} cannot be both renamed and deleted"
+                    )
+                explicit_deletes.add(value)
+
+            rename_pairs = list(explicit_renames.items())
+            remaining_removed = (
+                removed_values - set(explicit_renames) - explicit_deletes
+            )
+            remaining_added = added_values - set(explicit_renames.values())
+            if remaining_removed and remaining_added:
+                if len(remaining_removed) == 1 and len(remaining_added) == 1:
+                    # Unique 1:1 correspondence - treat as a rename
+                    rename_pairs.append(
+                        (
+                            next(iter(remaining_removed)),
+                            next(iter(remaining_added)),
+                        )
+                    )
+                    remaining_removed = set()
+                    remaining_added = set()
+                else:
+                    raise ReconcileConflict(
+                        f"Cannot reconcile lookup table {table}: "
+                        f"{len(remaining_removed)} managed value(s) disappeared "
+                        f"({', '.join(sorted(fmt(v) for v in remaining_removed))}) but "
+                        f"{len(remaining_added)} new value(s) appeared "
+                        f"({', '.join(sorted(fmt(v) for v in remaining_added))}); "
+                        "the mapping is ambiguous - "
+                        "pass renames= or deletes= to specify it"
+                    )
+
+            # A rename either updates the managed row in place, or merges an
+            # existing row carrying the new value (e.g. one inserted by a
+            # later import) into the managed identity
+            rename_updates: list[tuple[Any, tuple]] = []
+            merge_pairs: list[tuple[Any, Any, tuple]] = []
+            for old_value, new_value in rename_pairs:
+                canonical_id = managed_value_to_ids[old_value][0]
+                existing = value_to_ids.get(new_value, [])
+                if existing:
+                    merge_pairs.append((canonical_id, existing[0], new_value))
+                else:
+                    rename_updates.append((canonical_id, new_value))
+            delete_ids = [
+                managed_value_to_ids[value][0]
+                for value in (remaining_removed | explicit_deletes)
+            ]
+            insert_values = [
+                value
+                for value in remaining_added
+                if not value_to_ids.get(value)
+            ]
+
+            # Every column that holds a foreign key to this lookup table -
+            # used both to guard deletions and to repoint merged identities
+            referencing_columns = []
+            for other_table in self.db.tables:
+                if other_table.name == table:
+                    continue
+                for fk in other_table.foreign_keys:
+                    if fk.other_table != table:
+                        continue
+                    for column, other_column in zip(
+                        fk.columns, fk.other_columns
+                    ):
+                        if other_column == "id":
+                            referencing_columns.append((other_table.name, column))
+
+            # Rows being deleted must no longer be referenced anywhere but
+            # this table (whose foreign key is repointed below)
+            if delete_ids:
+                placeholders = ", ".join("?" for _ in delete_ids)
+                for other_name, other_column in referencing_columns:
+                    if other_name == self.name and other_column == fk_column:
+                        continue
+                    count = self.db.execute(
+                        f"SELECT COUNT(*) FROM {quote_identifier(other_name)} "
+                        f"WHERE {quote_identifier(other_column)} IN ({placeholders})",
+                        list(delete_ids),
+                    ).fetchone()[0]
+                    if count:
+                        raise ReconcileConflict(
+                            f"Cannot delete managed row(s) {list(delete_ids)} from {table}: "
+                            f"{count} row(s) in {other_name}.{other_column} still reference them - "
+                            "reassign or remove those references first"
+                        )
+
+            # Apply the plan. A unique index guarantees identities stay
+            # unique while values are rewritten in place
+            lookup_table.create_index(
+                lookup_columns, unique=True, if_not_exists=True
+            )
+
+            # Merge duplicate identities: an unmanaged row already carries
+            # the new value (e.g. it was inserted during a later import), so
+            # every reference to it is repointed at the canonical managed
+            # ID, the duplicate is removed and the canonical row takes the
+            # new value
+            for canonical_id, source_id, new_value in merge_pairs:
+                for other_name, other_column in referencing_columns:
+                    self.db.execute(
+                        f"UPDATE {quote_identifier(other_name)} "
+                        f"SET {quote_identifier(other_column)} = ? "
+                        f"WHERE {quote_identifier(other_column)} = ?",
+                        [canonical_id, source_id],
+                    )
+                self.db.execute(
+                    f"DELETE FROM {quote_identifier(table)} WHERE id = ?",
+                    [source_id],
+                )
+                self.db.execute(
+                    "UPDATE {lookup} SET {assignments} WHERE id = ?".format(
+                        lookup=quote_identifier(table),
+                        assignments=", ".join(
+                            f"{quote_identifier(col)} = ?" for col in lookup_columns
+                        ),
+                    ),
+                    [*new_value, canonical_id],
+                )
+
+            for row_id, new_value in rename_updates:
+                self.db.execute(
+                    "UPDATE {lookup} SET {assignments} WHERE id = ?".format(
+                        lookup=quote_identifier(table),
+                        assignments=", ".join(
+                            f"{quote_identifier(col)} = ?" for col in lookup_columns
+                        ),
+                    ),
+                    [*new_value, row_id],
+                )
+
+            inserted_ids = []
+            for value in insert_values:
+                cursor = self.db.execute(
+                    "INSERT INTO {lookup} ({cols}) VALUES ({placeholders})".format(
+                        lookup=quote_identifier(table),
+                        cols=", ".join(quote_identifier(c) for c in lookup_columns),
+                        placeholders=", ".join("?" for _ in value),
+                    ),
+                    list(value),
+                )
+                inserted_ids.append(cursor.lastrowid)
+
+            # Repoint every row in this table from the raw value columns
+            already_in_lookup = " AND ".join(
+                f"{quote_identifier(table)}.{quote_identifier(rename.get(column) or column)} IS "
+                f"{quote_identifier(self.name)}.{quote_identifier(column)}"
+                for column in columns
+            )
+            self.db.execute(
+                f"UPDATE {quote_identifier(self.name)} "
+                f"SET {quote_identifier(fk_column)} = ("
+                f"SELECT id FROM {quote_identifier(table)} WHERE {already_in_lookup}"
+                f") WHERE NOT ({all_columns_are_null})"
+            )
+            self.db.execute(
+                f"UPDATE {quote_identifier(self.name)} "
+                f"SET {quote_identifier(fk_column)} = NULL "
+                f"WHERE {all_columns_are_null}"
+            )
+
+            if delete_ids:
+                placeholders = ", ".join("?" for _ in delete_ids)
+                self.db.execute(
+                    f"DELETE FROM {quote_identifier(table)} "
+                    f"WHERE id IN ({placeholders})",
+                    list(delete_ids),
+                )
+                self.db.execute(
+                    'DELETE FROM "_sqlite_utils_extract_rows" '
+                    f"WHERE lookup_table = ? AND lookup_id IN ({placeholders})",
+                    [table, *delete_ids],
+                )
+
+            # Drop registry rows pointing at IDs that vanished outside of
+            # reconciliation (e.g. manual DELETEs)
+            self.db.execute(
+                'DELETE FROM "_sqlite_utils_extract_rows" WHERE lookup_table = ? '
+                f"AND lookup_id NOT IN (SELECT id FROM {quote_identifier(table)})",
+                [table],
+            )
+
+            # Maintain the managed-rows registry: keep the IDs this run
+            # started with (renames reuse their identity), minus deletions,
+            # plus any newly inserted IDs. Manually added rows are never
+            # registered this way, so they are never deleted later
+            registered_ids = list(
+                (managed_ids - set(delete_ids)) | set(inserted_ids)
+            )
+            for row_id in registered_ids:
+                self.db.execute(
+                    'INSERT OR IGNORE INTO "_sqlite_utils_extract_rows" '
+                    "(lookup_table, lookup_id) VALUES (?, ?)",
+                    [table, row_id],
+                )
+            self.db.execute(
+                'INSERT OR IGNORE INTO "_sqlite_utils_extract_lookups" '
+                "(lookup_table) VALUES (?)",
+                [table],
+            )
         return self
 
     def create_index(

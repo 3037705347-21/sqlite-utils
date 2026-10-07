@@ -17,7 +17,7 @@ This page lists the ``--help`` for every ``sqlite-utils`` CLI sub-command.
     import textwrap
     commands = list(cli.cli.commands.keys())
     go_first = [
-        "query", "memory", "insert", "upsert", "bulk", "search", "transform", "extract",
+        "query", "memory", "insert", "upsert", "bulk", "search", "transform", "extract", "reconcile",
         "schema", "insert-files", "analyze-tables", "convert", "tables", "views", "rows",
         "triggers", "indexes", "create-database", "create-table", "create-index", "drop-index",
         "migrate", "enable-fts", "populate-fts", "rebuild-fts", "disable-fts"
@@ -59,6 +59,7 @@ This page lists the ``--help`` for every ``sqlite-utils`` CLI sub-command.
         "search": "cli_search",
         "transform": "cli_transform_table",
         "extract": "cli_extract",
+        "reconcile": "cli_reconcile",
         "schema": "cli_schema",
         "insert-files": "cli_insert_files",
         "analyze-tables": "cli_analyze_tables",
@@ -539,6 +540,36 @@ See :ref:`cli_extract`.
       --rename <TEXT TEXT>...  Rename this column in extracted table
       --load-extension TEXT    Path to SQLite extension, with optional :entrypoint
       -h, --help               Show this message and exit.
+
+
+.. _cli_ref_reconcile:
+
+reconcile
+=========
+
+See :ref:`cli_reconcile`.
+
+::
+
+    Usage: sqlite-utils reconcile [OPTIONS] PATH TABLE COLUMNS...
+
+      Reconcile an extracted lookup table against current column values
+
+      Example:
+
+          sqlite-utils reconcile trees.db Street_Trees Species
+
+    Options:
+      --table TEXT                   Name of the lookup table to reconcile against
+      --fk-column TEXT               Name of the foreign key column in the table
+      --rename <TEXT TEXT>...        Rename this column in the lookup table
+      --rename-value <TEXT TEXT>...  Treat an old value as renamed to a new value,
+                                     e.g. --rename-value Fish Seafood
+      --delete-value TEXT            Treat an old value as deleted, e.g. --delete-
+                                     value Fish
+      --load-extension TEXT          Path to SQLite extension, with optional
+                                     :entrypoint
+      -h, --help                     Show this message and exit.
 
 
 .. _cli_ref_schema:

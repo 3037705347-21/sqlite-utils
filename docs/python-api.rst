@@ -2228,6 +2228,61 @@ Rows where every extracted column is ``null`` are not extracted: no record is cr
 .. note::
     In the CLI: :ref:`sqlite-utils extract <cli_extract>`
 
+.. _python_api_reconcile:
+
+Reconciling an extracted lookup table
+=====================================
+
+Once a column has been extracted, the underlying source data keeps changing: categories get added, renamed and deleted. ``table.reconcile(columns)`` brings an existing extracted lookup table back in line with the current raw values in the table, and can be run repeatedly.
+
+Reconciliation needs the raw value columns to be present on the table again. A typical loop is to re-import the source data with ``alter=True`` (the new/changed text columns are added back alongside the foreign key), reconcile, then drop the temporary raw columns later if desired:
+
+.. code-block:: python
+
+    db["Trees"].upsert_all(
+        rows_from_csv, pk="id", alter=True
+    )
+    db["Trees"].reconcile("Species")
+
+The method accepts the same ``table=``, ``fk_column=`` and ``rename=`` arguments as :meth:`extract`.
+
+On each run it compares the lookup table rows it manages against the distinct values currently found in the table:
+
+- **Unchanged** values are left alone.
+- **New** values are inserted into the lookup table and every row carrying that value is repointed to the new ID.
+- **Renamed** values keep their existing ID - the value is updated in place, so foreign key references in this table and elsewhere automatically follow the rename.
+- **Deleted** values have their lookup row removed, after this table's foreign keys have been repointed away from them.
+
+A value that disappeared and a value that appeared are treated as a rename only when the pairing is unique: exactly one managed value gone and exactly one new value present. If more values changed than can be paired uniquely, ``reconcile()`` raises ``ReconcileConflict`` and **nothing is written** - the whole operation runs in a single transaction.
+
+If a re-import already inserted a duplicate lookup row for the new name (for example ``upsert_all()`` with ``extracts=`` did), reconciliation merges that duplicate back into the original managed ID - references in every table are repointed and the duplicate is removed.
+
+Resolve ambiguous runs explicitly with ``renames=`` (and ``deletes=`` for values that really were retired):
+
+.. code-block:: python
+
+    db["Trees"].reconcile(
+        "Species",
+        renames={"Palm": "Palm tree"},
+        deletes=["Mangrove"],
+    )
+
+For extractions of multiple columns, use tuples of values:
+
+.. code-block:: python
+
+    db["Trees"].reconcile(
+        ["CommonName", "LatinName"],
+        renames={("Palm", "Arecaceae"): ("Palm tree", "Arecaceae")},
+    )
+
+A managed row due to be deleted is also a conflict if rows in another table still reference it - those references cannot be updated automatically, so you must reassign or remove them first. (Renames are safe for external references: the ID does not change.)
+
+**Manual rows are protected.** Rows you inserted into the lookup table yourself are never modified or deleted. On the first reconciliation for a lookup table, the managed set is exactly the set of rows this table's foreign key currently points to; afterwards sqlite-utils remembers managed rows in internal ``_sqlite_utils_extract_lookups`` and ``_sqlite_utils_extract_rows`` tables. Rows that are not referenced on the first run - and rows never inserted by reconciliation - are treated as manual forever. The only exceptions are an unmanaged row this table already references, which can be folded into a managed identity as the duplicate described above, and an explicit ``renames=`` naming that row's value.
+
+.. note::
+    In the CLI: :ref:`sqlite-utils reconcile <cli_reconcile>`
+
 .. _python_api_hash:
 
 Setting an ID based on the hash of the row contents
