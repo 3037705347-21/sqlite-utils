@@ -1803,6 +1803,31 @@ The ``-`` argument indicates data should be read from standard input. The string
 
 When inserting data from standard input only the following column definitions are supported: ``name``, ``path``, ``content``, ``content_text``, ``sha256``, ``md5`` and ``size``.
 
+Reconciling a directory with ``sync-files``
+===========================================
+
+The ``sync-files`` command reconciles a database table with the current contents of one or more directories. It is designed to be run repeatedly as files are added, modified and deleted:
+
+.. code-block:: bash
+
+    sqlite-utils sync-files docs.db files path/to/materials
+
+The command maintains three tables:
+
+- ``files`` has one row per current file, keyed by its path relative to the synced directory and referencing its content by SHA-256 hash. Rows written by the sync carry a ``managed_by`` tag (the directory's absolute path by default).
+- ``files_content`` stores each distinct BLOB exactly once, so identical files at different paths share one copy. A BLOB is only removed when the last reference to it disappears.
+- ``files_history`` is an append-only log of ``insert``, ``update`` and ``delete`` events, recording the previous and new hashes, size and timestamp - so the final state of a deleted file remains queryable.
+
+Source files that disappeared are removed, but only when their row is tagged for this sync; rows inserted by other means (``managed_by`` is NULL) are left untouched. All reads happen before any write and every change is committed in a single transaction, so a read or write failure or an interrupted run leaves no partial state - running the command again converges to the correct result.
+
+Custom table names and ownership tags can be specified:
+
+.. code-block:: bash
+
+    sqlite-utils sync-files docs.db files path/to/materials \\
+        --content-table docs_blobs --history-table docs_log \\
+        --managed-by materials-import
+
 .. _cli_convert:
 
 Converting data in columns

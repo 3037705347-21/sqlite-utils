@@ -3026,6 +3026,91 @@ def insert_files(
             )
 
 
+@cli.command(name="sync-files")
+@click.argument(
+    "path",
+    type=click.Path(file_okay=True, dir_okay=False, allow_dash=False),
+    required=True,
+)
+@click.argument("table")
+@click.argument(
+    "directory",
+    nargs=-1,
+    required=True,
+    type=click.Path(exists=True, file_okay=False, dir_okay=True),
+)
+@click.option(
+    "--content-table",
+    help="Name of the content-addressed BLOB table (defaults to TABLE_content)",
+)
+@click.option(
+    "--history-table",
+    help="Name of the change-history table (defaults to TABLE_history)",
+)
+@click.option(
+    "--managed-by",
+    help=(
+        "Tag marking rows owned by this sync (defaults to each directory's "
+        "absolute path). Only tagged rows are removed when their source "
+        "file disappears; manual rows are left untouched."
+    ),
+)
+def sync_files(path, table, directory, content_table, history_table, managed_by):
+    """
+    Reconcile a table with the current contents of one or more directories
+
+    Creates and maintains three tables: TABLE (one row per file, referencing
+    the content by SHA-256 hash), TABLE_content (each distinct BLOB stored
+    once) and TABLE_history (insert/update/delete events). Safe to run
+    repeatedly; manual rows (with no managed_by tag) are preserved.
+
+    Example:
+
+    \b
+        sqlite-utils sync-files docs.db files path/to/materials
+    """
+    from .reconcile import FileSyncError
+    from .reconcile import sync_files as _sync_files
+
+    db = sqlite_utils.Database(path)
+    _register_db_for_cleanup(db)
+    try:
+        result = _sync_files(
+            db,
+            list(directory),
+            table=table,
+            content_table=content_table,
+            history_table=history_table,
+            managed_by=managed_by,
+        )
+    except FileSyncError as e:
+        raise click.ClickException(str(e))
+    except OSError as e:
+        raise click.ClickException(f"Could not read source file: {e}")
+    click.echo(
+        "{added} added, {updated} updated, {deleted} deleted, "
+        "{unchanged} unchanged".format(
+            added=result.added,
+            updated=result.updated,
+            deleted=result.deleted,
+            unchanged=result.unchanged,
+        )
+    )
+    click.echo(
+        "{stored} unique contents stored, {removed} orphaned contents "
+        "removed".format(
+            stored=result.contents_added,
+            removed=result.contents_deleted,
+        )
+    )
+    for conflict in result.conflicts:
+        click.echo(
+            f"Warning: '{conflict}' exists in the table but is not managed "
+            "by this sync, left untouched",
+            err=True,
+        )
+
+
 @cli.command(name="analyze-tables")
 @click.argument(
     "path",
