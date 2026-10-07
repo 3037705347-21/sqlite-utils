@@ -115,3 +115,19 @@ sqlite_utils.utils.flatten
 --------------------------
 
 .. autofunction:: sqlite_utils.utils.flatten
+
+sqlite_utils.reconcile
+======================
+
+.. _reference_sync_column_analysis:
+
+sqlite_utils.sync_column_analysis
+---------------------------------
+
+.. autofunction:: sqlite_utils.sync_column_analysis
+
+.. autoclass:: sqlite_utils.ColumnAnalysisResult
+   :members:
+
+.. autoclass:: sqlite_utils.ColumnAnalysisError
+   :members:

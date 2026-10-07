@@ -1074,6 +1074,46 @@ The ``most_common`` and ``least_common`` columns will contain nested JSON arrays
         ["Condarco", 4288]
     ]
 
+.. _cli_sync_analysis:
+
+Reconciling column statistics with ``sync-analysis``
+----------------------------------------------------
+
+The ``--save`` option above overwrites the saved results on every run, so it cannot show how a column evolves. The ``sync-analysis`` command turns repeated analysis into a full reconciliation and is designed to be run every time the data changes:
+
+.. code-block:: bash
+
+    sqlite-utils sync-analysis github.db tags
+
+The command maintains three tables:
+
+- ``tags_column_stats`` holds one row per column with the current statistics (the same values produced by ``analyze-tables``) plus a ``note`` column and an ``analyzed_at`` timestamp. Rows whose statistics did not change are not rewritten.
+- ``tags_column_stats_history`` is an append-only record of snapshots. A snapshot is appended only when the statistics differ from that column's latest snapshot, so rerunning against unchanged data writes nothing - the history contains one row per actual change.
+- ``tags_column_stats_archive`` receives the final statistics row of any column that has been dropped from the table, including anything stored in its ``note`` column.
+
+History is pruned to the most recent ten snapshots per column; use ``--retention`` to change that (or pass a large value such as ``--retention 1000000`` to effectively keep everything):
+
+.. code-block:: bash
+
+    sqlite-utils sync-analysis github.db tags --retention 30
+
+Columns dropped from the table are archived by default. Pass ``--on-stale delete`` to delete their statistics rows instead - rows that carry a manual note are still archived, so notes are never destroyed:
+
+.. code-block:: bash
+
+    sqlite-utils sync-analysis github.db tags --on-stale delete
+
+You can annotate a column by editing the ``note`` column directly; reconciliation never overwrites or removes it while the column exists:
+
+.. code-block:: sql
+
+    UPDATE tags_column_stats SET note = 'Reviewed by LC, 2026-02-01'
+        WHERE tbl = 'tags' AND "column" = 'sha';
+
+Every column is analyzed before anything is written, and all changes commit in a single transaction, so a failed or interrupted analysis of one column cannot leave half-written statistics or history - running the command again converges to the correct result.
+
+In Python, see :ref:`sqlite_utils.sync_column_analysis() <reference_sync_column_analysis>`.
+
 .. _cli_create_database:
 
 Creating an empty database

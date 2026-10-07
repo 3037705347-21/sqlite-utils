@@ -3137,6 +3137,131 @@ def _analyze(db, tables, columns, save, common_limit=10, no_most=False, no_least
         click.echo(details)
 
 
+@cli.command(name="sync-analysis")
+@click.argument(
+    "path",
+    type=click.Path(file_okay=True, dir_okay=False, allow_dash=False),
+    required=True,
+)
+@click.argument("table")
+@click.option(
+    "-c",
+    "--column",
+    "columns",
+    type=str,
+    multiple=True,
+    help="Specific columns to analyze (defaults to every column)",
+)
+@click.option("--common-limit", type=int, default=10, help="How many common values")
+@click.option(
+    "--value-truncate",
+    type=int,
+    default=None,
+    help="Truncate common values to this many characters",
+)
+@click.option(
+    "--retention",
+    type=int,
+    default=10,
+    help="Number of history snapshots to keep per column (older ones pruned)",
+)
+@click.option(
+    "--on-stale",
+    type=click.Choice(["archive", "delete"]),
+    default="archive",
+    help=(
+        "What to do with statistics rows whose column was dropped from the "
+        "table. Rows with a manual note are always archived."
+    ),
+)
+@click.option(
+    "--stats-table",
+    help="Name of the current statistics table (defaults to TABLE_column_stats)",
+)
+@click.option(
+    "--history-table",
+    help="Name of the history snapshots table (defaults to STATS_TABLE_history)",
+)
+@click.option(
+    "--archive-table",
+    help="Name of the stale-column archive table (defaults to STATS_TABLE_archive)",
+)
+@click.option("--no-most", is_flag=True, default=False, help="Skip most common values")
+@click.option(
+    "--no-least", is_flag=True, default=False, help="Skip least common values"
+)
+@load_extension_option
+def sync_analysis(
+    path,
+    table,
+    columns,
+    common_limit,
+    value_truncate,
+    retention,
+    on_stale,
+    stats_table,
+    history_table,
+    archive_table,
+    no_most,
+    no_least,
+    load_extension,
+):
+    """Reconcile saved column statistics for a table
+
+    Maintains three tables: TABLE_column_stats with one row of current
+    statistics per column, TABLE_column_stats_history with one row per
+    analysis whose statistics changed (deduplicated, pruned to the retention
+    limit) and TABLE_column_stats_archive holding the final statistics -
+    with any manual notes - of columns that were dropped. Safe to run
+    repeatedly; an unchanged run writes nothing.
+
+    Example:
+
+    \b
+        sqlite-utils sync-analysis data.db trees
+    """
+    from .reconcile import ColumnAnalysisError
+    from .reconcile import sync_column_analysis as _sync_column_analysis
+
+    db = sqlite_utils.Database(path)
+    _register_db_for_cleanup(db)
+    _load_extensions(db, load_extension)
+    try:
+        result = _sync_column_analysis(
+            db,
+            table,
+            columns=list(columns) or None,
+            common_limit=common_limit,
+            value_truncate=value_truncate,
+            retention=retention,
+            on_stale=on_stale,
+            stats_table=stats_table,
+            history_table=history_table,
+            archive_table=archive_table,
+            most_common=not no_most,
+            least_common=not no_least,
+        )
+    except ColumnAnalysisError as e:
+        raise click.ClickException(str(e))
+    click.echo(
+        "{added} added, {updated} updated, {unchanged} unchanged".format(
+            added=result.added,
+            updated=result.updated,
+            unchanged=result.unchanged,
+        )
+    )
+    click.echo(
+        "{added} snapshots added, {pruned} old snapshots pruned".format(
+            added=result.snapshots_added, pruned=result.snapshots_pruned
+        )
+    )
+    click.echo(
+        "{deleted} stale columns removed, {archived} stale columns archived".format(
+            deleted=result.deleted, archived=result.archived
+        )
+    )
+
+
 @cli.command()
 @click.argument("packages", nargs=-1, required=False)
 @click.option(
