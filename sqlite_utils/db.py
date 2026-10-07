@@ -322,6 +322,38 @@ XIndexColumn = namedtuple(
 Trigger = namedtuple("Trigger", ("name", "table", "sql"))
 
 
+@dataclass(frozen=True)
+class M2MReconcileResult:
+    """
+    Result of reconciling a many-to-many table against a source of pairs,
+    returned by :meth:`Table.m2m_reconcile`.
+
+    Counts describe what this run changed:
+
+    - ``added``: link rows that did not exist and were created, tagged with
+      ``managed_by``
+    - ``removed``: link rows owned by this run's tag that were no longer in
+      the source and have been deleted
+    - ``unchanged``: link rows owned by this run's tag that were still in
+      the source
+    - ``unclaimed``: pairs the source asked for where a link row already
+      exists but is not owned by this tag (a manual row or another source's
+      row) - these were left untouched
+    - ``desired``: number of distinct pairs in the source after de-duplication
+
+    A failed run raises instead and rolls everything back, so this result is
+    only ever returned for a fully committed run.
+    """
+
+    m2m_table: str
+    managed_by: str
+    desired: int
+    added: int
+    removed: int
+    unchanged: int
+    unclaimed: int
+
+
 class TransformError(Exception):
     pass
 
@@ -477,6 +509,10 @@ class BadMultiValues(Exception):
 
     def __init__(self, values: object) -> None:
         self.values = values
+
+
+class UnsafeRelationshipTable(Exception):
+    "Relationship table cannot safely be reconciled against a source"
 
 
 _COUNTS_TABLE_CREATE_SQL = """
@@ -5291,6 +5327,370 @@ class Table(Queryable):
                 replace=True,
             )
         return self
+
+    def m2m_reconcile(
+        self,
+        other_table: Union[str, "Table"],
+        pairs: Iterable[tuple[Any, Any]],
+        *,
+        m2m_table: str | None = None,
+        left_on: Union[str, Sequence[str], None] = None,
+        right_on: Union[str, Sequence[str], None] = None,
+        managed_by: str = "sync",
+    ) -> M2MReconcileResult:
+        """
+        Reconcile a many-to-many relationship table against a source batch of
+        pairs (for example, rows read from mapping files), so the sync can be
+        safely re-run.
+
+        Pairs are given as ``(left, right)`` 2-tuples - scalar values for
+        single-column keys, tuples for compound keys. The method then, all in
+        a single transaction:
+
+        - creates links that exist in the source but not in the table
+          (``added``), tagged in the link table's ``managed_by`` column;
+        - deletes links owned by this run's ``managed_by`` tag that have been
+          removed from the source (``removed``);
+        - leaves every other link row untouched - rows maintained manually
+          (``managed_by`` is ``NULL``) or owned by another tag;
+        - does not claim rows that already exist without this tag, reporting
+          them as ``unclaimed`` instead.
+
+        Re-running with an unchanged source changes nothing. If a pair refers
+        to a record that cannot be found on either side, or the relationship
+        table is ambiguous or unsafe to reconcile, an exception is raised
+        before commit and the whole run is rolled back - a partial set of
+        relationships is never left behind.
+
+        :param other_table: The table on the other side, as a name or object.
+        :param pairs: Iterable of ``(left, right)`` 2-tuples from the source.
+        :param m2m_table: Explicit name of the relationship table, required if
+          more than one candidate table exists.
+        :param left_on: Column(s) in this table that the left values refer
+          to, defaults to this table's primary key columns.
+        :param right_on: Column(s) in ``other_table`` that the right values
+          refer to, defaults to that table's primary key columns.
+        :param managed_by: Ownership tag written onto rows this sync manages,
+          defaults to ``"sync"``.
+        """
+        if not isinstance(managed_by, str) or not managed_by:
+            raise ValueError("managed_by must be a non-empty string")
+
+        # Normalize and de-duplicate pairs up front
+        raw_pairs: list[tuple[Any, Any]] = []
+        seen_pairs: set[tuple[Any, Any]] = set()
+        for pair in pairs:
+            if not isinstance(pair, (tuple, list)) or len(pair) != 2:
+                raise ValueError("pairs must be 2-tuples of (left, right)")
+            left, right = pair
+            if isinstance(left, list):
+                left = tuple(left)
+            if isinstance(right, list):
+                right = tuple(right)
+            pair = (left, right)
+            if pair not in seen_pairs:
+                seen_pairs.add(pair)
+                raw_pairs.append(pair)
+
+        with self.db.atomic():
+            if isinstance(other_table, str):
+                other_table = self.db.table(other_table)
+
+            # Both master-data tables must already exist - this sync links
+            # existing records, it does not create them
+            if not self.exists():
+                raise NoTable(f"Table {self.name} does not exist")
+            if not other_table.exists():
+                raise NoTable(f"Table {other_table.name} does not exist")
+
+            def _validate_columns(table_obj: "Table", columns: list[str]) -> None:
+                available = {column.name for column in table_obj.columns}
+                for column in columns:
+                    if column not in available and column not in ROWID_ALIASES:
+                        raise InvalidColumns(
+                            f"Column {column} does not exist on table {table_obj.name}"
+                        )
+
+            # Resolve which table holds the relationship
+            if m2m_table is not None:
+                m2m_table_name = m2m_table
+            else:
+                candidates = self.db.m2m_table_candidates(
+                    self.name, other_table.name
+                )
+                if len(candidates) == 1:
+                    m2m_table_name = candidates[0]
+                elif len(candidates) > 1:
+                    raise NoObviousTable(
+                        f"No single obvious m2m table for {self.name}, "
+                        f"{other_table.name} - use m2m_table= parameter"
+                    )
+                else:
+                    m2m_table_name = "{}_{}".format(
+                        *sorted([self.name, other_table.name])
+                    )
+
+            link_table = self.db.table(m2m_table_name)
+
+            # (link table column(s), column(s) in the referenced table) for
+            # each side - inherited from existing foreign keys when present
+            def _link_spec(
+                fk: ForeignKey | None, table_obj: "Table"
+            ) -> tuple[tuple[str, ...], tuple[str, ...]]:
+                if fk is not None:
+                    return tuple(fk.columns), tuple(fk.other_columns)
+                return (f"{table_obj.name}_id",), tuple(table_obj.pks)
+
+            self_link_cols: tuple[str, ...]
+            other_link_cols: tuple[str, ...]
+            self_ref_cols: tuple[str, ...]
+            other_ref_cols: tuple[str, ...]
+            if not link_table.exists():
+                self_link_cols = (f"{self.name}_id",)
+                other_link_cols = (f"{other_table.name}_id",)
+                self_ref_cols = tuple(self.pks)
+                other_ref_cols = tuple(other_table.pks)
+                self.db.create_table(
+                    m2m_table_name,
+                    {self_link_cols[0]: int, other_link_cols[0]: int},
+                    pk=(self_link_cols[0], other_link_cols[0]),
+                    foreign_keys=[self_link_cols[0], other_link_cols[0]],
+                )
+            else:
+                fks_by_parent = {
+                    fk.other_table: fk for fk in link_table.foreign_keys
+                }
+                self_link_cols, self_ref_cols = _link_spec(
+                    fks_by_parent.get(self.name), self
+                )
+                other_link_cols, other_ref_cols = _link_spec(
+                    fks_by_parent.get(other_table.name), other_table
+                )
+                # Both link columns must exist
+                _validate_columns(link_table, list(self_link_cols + other_link_cols))
+                # Pairs must be unique, otherwise re-runs could duplicate
+                # links and the diff cannot be computed safely
+                if set(link_table.pks) != set(self_link_cols + other_link_cols):
+                    raise UnsafeRelationshipTable(
+                        f"Table {m2m_table_name} cannot safely be reconciled: "
+                        "its primary key must be exactly the relationship "
+                        "columns "
+                        f"{', '.join(self_link_cols + other_link_cols)}"
+                    )
+
+            def _key_columns(
+                on: Union[str, Sequence[str], None], default: tuple[str, ...]
+            ) -> list[str]:
+                if on is None:
+                    return list(default)
+                elif isinstance(on, str):
+                    return [on]
+                return list(on)
+
+            # Source values refer by default to whatever columns the link
+            # table references (its foreign keys), falling back to PKs
+            left_key_cols = _key_columns(left_on, self_ref_cols)
+            right_key_cols = _key_columns(right_on, other_ref_cols)
+
+            _validate_columns(self, left_key_cols)
+            _validate_columns(other_table, right_key_cols)
+
+            # Ensure the ownership marker column exists - existing rows get
+            # NULL and are thereby treated as manually maintained
+            link_column_names = {column.name for column in link_table.columns}
+            if "managed_by" not in link_column_names:
+                self.db.execute(
+                    f"ALTER TABLE {quote_identifier(m2m_table_name)} "
+                    'ADD COLUMN "managed_by" TEXT'
+                )
+
+            def _as_key_tuple(
+                value: Any, key_cols: list[str], side: str
+            ) -> tuple[Any, ...]:
+                if len(key_cols) == 1:
+                    if isinstance(value, (tuple, list)):
+                        if len(value) != 1:
+                            raise ValueError(
+                                f"{side} key refers to one column but got "
+                                f"{len(value)} values"
+                            )
+                        value = value[0]
+                    return (value,)
+                if not isinstance(value, (tuple, list)) or len(value) != len(
+                    key_cols
+                ):
+                    raise ValueError(
+                        f"{side} key refers to {len(key_cols)} columns "
+                        f"({', '.join(key_cols)}) but got: {value!r}"
+                    )
+                return tuple(value)
+
+            wanted_left = {
+                _as_key_tuple(pair[0], left_key_cols, self.name)
+                for pair in raw_pairs
+            }
+            wanted_right = {
+                _as_key_tuple(pair[1], right_key_cols, other_table.name)
+                for pair in raw_pairs
+            }
+
+            def _resolve_side(
+                table_obj: "Table",
+                key_cols: list[str],
+                ref_cols: tuple[str, ...],
+                wanted: set[tuple[Any, ...]],
+            ) -> dict[tuple[Any, ...], tuple[Any, ...]]:
+                select_list = ", ".join(
+                    quote_identifier(column)
+                    for column in list(key_cols) + list(ref_cols)
+                )
+                table_quoted = quote_identifier(table_obj.name)
+                resolved: dict[tuple[Any, ...], tuple[Any, ...]] = {}
+                if len(key_cols) == 1:
+                    # Batch the lookups with IN to avoid one query per pair
+                    values = {key[0] for key in wanted}
+                    key_quoted = quote_identifier(key_cols[0])
+                    for batch in chunks(values, SQLITE_MAX_VARS):
+                        batch = list(batch)
+                        placeholders = ", ".join("?" for _ in batch)
+                        cursor = self.db.execute(
+                            f"SELECT {select_list} FROM {table_quoted} "
+                            f"WHERE {key_quoted} IN ({placeholders})",
+                            batch,
+                        )
+                        assert cursor.description is not None
+                        descriptions = [d[0] for d in cursor.description]
+                        for row in cursor.fetchall():
+                            record = dict(zip(descriptions, row))
+                            key = (record[key_cols[0]],)
+                            ref = tuple(record[column] for column in ref_cols)
+                            if key in resolved:
+                                raise UnsafeRelationshipTable(
+                                    f"Key values {key[0]!r} in column "
+                                    f"{key_cols[0]} matched more than one row "
+                                    f"in table {table_obj.name}"
+                                )
+                            resolved[key] = ref
+                else:
+                    where = " AND ".join(
+                        f"{quote_identifier(column)} = ?" for column in key_cols
+                    )
+                    for key in wanted:
+                        cursor = self.db.execute(
+                            f"SELECT {select_list} FROM {table_quoted} "
+                            f"WHERE {where}",
+                            list(key),
+                        )
+                        assert cursor.description is not None
+                        descriptions = [d[0] for d in cursor.description]
+                        rows = cursor.fetchall()
+                        if len(rows) > 1:
+                            raise UnsafeRelationshipTable(
+                                f"Key values {list(key)} in columns "
+                                f"({', '.join(key_cols)}) matched more than "
+                                f"one row in table {table_obj.name}"
+                            )
+                        if rows:
+                            record = dict(zip(descriptions, rows[0]))
+                            resolved[key] = tuple(
+                                record[column] for column in ref_cols
+                            )
+                missing = sorted(
+                    {key for key in wanted if key not in resolved},
+                    key=repr,
+                )
+                if missing:
+                    raise NotFoundError(
+                        f"{len(missing)} record(s) referenced in table "
+                        f"{table_obj.name} by column(s) ({', '.join(key_cols)}) "
+                        f"could not be found: "
+                        + ", ".join(repr(key[0] if len(key) == 1 else key) for key in missing)
+                    )
+                return resolved
+
+            resolved_left = _resolve_side(
+                self, left_key_cols, self_ref_cols, wanted_left
+            )
+            resolved_right = _resolve_side(
+                other_table, right_key_cols, other_ref_cols, wanted_right
+            )
+
+            # Desired set of stored pairs, oriented (this table, other table)
+            desired: set[tuple[tuple[Any, ...], tuple[Any, ...]]] = set()
+            for left, right in raw_pairs:
+                left_key = _as_key_tuple(left, left_key_cols, self.name)
+                right_key = _as_key_tuple(right, right_key_cols, other_table.name)
+                desired.add(
+                    (resolved_left[left_key], resolved_right[right_key])
+                )
+
+            # Current state of the link table
+            existing_pairs: set[
+                tuple[tuple[Any, ...], tuple[Any, ...]]
+            ] = set()
+            managed_pairs: set[
+                tuple[tuple[Any, ...], tuple[Any, ...]]
+            ] = set()
+            for row in link_table.rows:
+                left_values = tuple(row[column] for column in self_link_cols)
+                right_values = tuple(row[column] for column in other_link_cols)
+                pair = (left_values, right_values)
+                existing_pairs.add(pair)
+                if row.get("managed_by") == managed_by:
+                    managed_pairs.add(pair)
+
+            removed = managed_pairs - desired
+            added = desired - existing_pairs
+            unchanged = len(managed_pairs & desired)
+            unclaimed = len((desired & existing_pairs) - managed_pairs)
+
+            def _flatten(
+                pair: tuple[tuple[Any, ...], tuple[Any, ...]]
+            ) -> tuple[Any, ...]:
+                return pair[0] + pair[1]
+
+            all_link_cols = list(self_link_cols) + list(other_link_cols)
+
+            if removed:
+                conditions = " AND ".join(
+                    [quote_identifier(column) + " = ?" for column in all_link_cols]
+                    + ['"managed_by" = ?']
+                )
+                delete_sql = (
+                    f"DELETE FROM {quote_identifier(m2m_table_name)} "
+                    f"WHERE {conditions}"
+                )
+                delete_params = [
+                    _flatten(pair) + (managed_by,) for pair in removed
+                ]
+                self.db.conn.executemany(delete_sql, delete_params)
+
+            if added:
+                column_names = ", ".join(
+                    quote_identifier(column)
+                    for column in all_link_cols + ["managed_by"]
+                )
+                placeholders = ", ".join(
+                    "?" for _ in all_link_cols + ["managed_by"]
+                )
+                insert_sql = (
+                    f"INSERT OR IGNORE INTO {quote_identifier(m2m_table_name)} "
+                    f"({column_names}) VALUES ({placeholders})"
+                )
+                insert_params = [
+                    _flatten(pair) + (managed_by,) for pair in added
+                ]
+                self.db.conn.executemany(insert_sql, insert_params)
+
+            return M2MReconcileResult(
+                m2m_table=m2m_table_name,
+                managed_by=managed_by,
+                desired=len(desired),
+                added=len(added),
+                removed=len(removed),
+                unchanged=unchanged,
+                unclaimed=unclaimed,
+            )
 
     def analyze(self) -> None:
         "Run ANALYZE against this table"

@@ -1473,6 +1473,51 @@ It it finds multiple candidate tables with foreign keys to both of the specified
 
 The ``.m2m()`` method also takes an optional ``pk=`` argument to specify the primary key that should be used if the table is created, and an optional ``alter=True`` argument to specify that any missing columns of an existing table should be added if they are needed.
 
+Reconciling a many-to-many table against a source
+-------------------------------------------------
+
+Use the ``table.m2m_reconcile(...)`` method when the links for a relationship arrive as a batch from an external source - such as mapping files that get sent repeatedly - and the link table also contains links that were maintained manually. The method makes the sync safe to re-run by reconciling the source batch against what is already in the link table, all in a single transaction:
+
+- pairs that appear in the source but not yet in the table are created;
+- pairs that were created by this sync but have been removed from the source are deleted;
+- manually maintained links, and links owned by other sync runs, are left untouched.
+
+.. code-block:: python
+
+    result = db["dogs"].m2m_reconcile(
+        "humans", [(1, 1), (1, 2), (2, 1)]
+    )
+
+Pairs are given as ``(left, right)`` tuples. Values refer by default to whatever the link table's foreign keys reference - usually the primary key columns - so use ``left_on=`` and ``right_on=`` when the source instead carries other, unique columns:
+
+.. code-block:: python
+
+    result = db["dogs"].m2m_reconcile(
+        "humans",
+        [("Cleo", "Natalie"), ("Cleo", "Simon")],
+        left_on="name",
+        right_on="name",
+    )
+
+Rows that this method manages are tagged in a ``managed_by`` column on the link table, defaulting to the tag ``"sync"``. Pass ``managed_by=`` to identify a particular source - each tag is reconciled independently, so two sources can share a link table without deleting each other's rows. An existing link table that lacks the column has it added automatically, and its previous rows are treated as manual.
+
+The method returns an ``M2MReconcileResult`` with the counts for this run:
+
+- ``added`` - links created
+- ``removed`` - links deleted because this tag no longer owned them in the source
+- ``unchanged`` - links this tag already owned and that were still in the source
+- ``unclaimed`` - pairs the source asked for where a link already existed without this tag; they were not modified
+- ``desired`` - distinct pairs found in the source
+
+Re-running with an unchanged source changes nothing (``added`` and ``removed`` are both zero). Failures are explicit and atomic - the whole run rolls back and a partial set of links is never left behind:
+
+- ``sqlite_utils.db.NoObviousTable`` if more than one candidate link table exists (use ``m2m_table=`` to name the right one);
+- ``sqlite_utils.db.NotFoundError`` if a pair refers to a record that cannot be found on either side;
+- ``sqlite_utils.db.UnsafeRelationshipTable`` if the existing link table's primary key is not the two relationship columns (so pairs would not be unique), or a source value matches more than one record;
+- ``sqlite_utils.db.NoTable`` if a table on either side does not exist.
+
+If execution is interrupted, uncommitted changes are discarded and running the sync again converges the table onto the source state.
+
 .. _python_api_m2m_lookup:
 
 Using m2m and lookup tables together
