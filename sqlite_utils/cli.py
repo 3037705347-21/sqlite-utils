@@ -3113,8 +3113,7 @@ def _analyze(db, tables, columns, save, common_limit=10, no_most=False, no_least
             "\n\n  Least common:", column_details.least_common
         )
         details = (
-            (
-                textwrap.dedent("""
+            textwrap.dedent("""
         {table}.{column}: ({i}/{total})
 
           Total rows: {total_rows}
@@ -3123,17 +3122,15 @@ def _analyze(db, tables, columns, save, common_limit=10, no_most=False, no_least
 
           Distinct values: {num_distinct}{most_common_rendered}{least_common_rendered}
         """)
-                .strip()
-                .format(
-                    i=i + 1,
-                    total=len(todo),
-                    most_common_rendered=most_common_rendered,
-                    least_common_rendered=least_common_rendered,
-                    **column_details._asdict(),
-                )
+            .strip()
+            .format(
+                i=i + 1,
+                total=len(todo),
+                most_common_rendered=most_common_rendered,
+                least_common_rendered=least_common_rendered,
+                **column_details._asdict(),
             )
-            + "\n"
-        )
+        ) + "\n"
         click.echo(details)
 
 
@@ -3480,7 +3477,10 @@ def _load_migration_sets(files):
             "__file__": str(filepath),
             "__name__": "__sqlite_utils_migration__",
         }
-        exec(code, namespace)  # noqa: S102
+        # Compile with the real filename so inspect.getsource() works on
+        # the migration functions (used to hash their contents) and
+        # tracebacks point at the migrations file
+        exec(compile(code, str(filepath), "exec"), namespace)  # noqa: S102
         migration_sets.extend(
             obj for obj in namespace.values() if _compatible_migration_set(obj)
         )
@@ -3489,20 +3489,54 @@ def _load_migration_sets(files):
 
 def _display_migration_list(db, migration_sets):
     for migration_set in migration_sets:
+        is_native = isinstance(migration_set, sqlite_utils.Migrations)
         click.echo(f"Migrations for: {migration_set.name}")
         click.echo()
         click.echo("  Applied:")
         for migration in migration_set.applied(db):
             click.echo(f"    {migration.name} - {migration.applied_at}")
         click.echo()
+        interrupted = migration_set.interrupted(db) if is_native else []
+        interrupted_names = {migration.name for migration in interrupted}
         click.echo("  Pending:")
         output = False
         for migration in migration_set.pending(db):
+            # Interrupted migrations are reported in their own section below
+            if migration.name in interrupted_names:
+                continue
             output = True
             click.echo(f"    {migration.name}")
         if not output:
             click.echo("    (none)")
         click.echo()
+        if interrupted:
+            click.echo("  Interrupted:")
+            for migration in interrupted:
+                if migration.checkpoints:
+                    steps = ", ".join(migration.checkpoints)
+                    click.echo(
+                        f"    {migration.name} (will resume; steps completed: {steps})"
+                    )
+                else:
+                    click.echo(
+                        f"    {migration.name} (will resume; no steps completed)"
+                    )
+            click.echo()
+        if is_native:
+            mismatches = migration_set.drift(db)
+            if mismatches:
+                click.echo("  History problems:")
+                for mismatch in mismatches:
+                    state = (
+                        "interrupted while running"
+                        if mismatch.running
+                        else "recorded as applied"
+                    )
+                    click.echo(
+                        f"    {mismatch.name}: migration code has changed "
+                        f"since it was {state}"
+                    )
+                click.echo()
 
 
 def _stop_before_for_migration_set(stop_before, migration_set_name):
@@ -3668,12 +3702,16 @@ FILE_COLUMNS = {
     "ctime": lambda p: p.stat().st_ctime,
     "mtime_int": lambda p: int(p.stat().st_mtime),
     "ctime_int": lambda p: int(p.stat().st_ctime),
-    "mtime_iso": lambda p: datetime.fromtimestamp(p.stat().st_mtime, timezone.utc)
-    .replace(tzinfo=None)
-    .isoformat(),
-    "ctime_iso": lambda p: datetime.fromtimestamp(p.stat().st_ctime, timezone.utc)
-    .replace(tzinfo=None)
-    .isoformat(),
+    "mtime_iso": lambda p: (
+        datetime.fromtimestamp(p.stat().st_mtime, timezone.utc)
+        .replace(tzinfo=None)
+        .isoformat()
+    ),
+    "ctime_iso": lambda p: (
+        datetime.fromtimestamp(p.stat().st_ctime, timezone.utc)
+        .replace(tzinfo=None)
+        .isoformat()
+    ),
     "size": lambda p: p.stat().st_size,
     "stem": lambda p: p.stem,
     "suffix": lambda p: p.suffix,

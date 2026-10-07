@@ -4,6 +4,14 @@
  Changelog
 ===========
 
+.. _v_next:
+
+Unreleased
+----------
+
+- The database migrations system now records a ``content_hash`` and ``status`` for every migration it applies. Re-running migrations reconciles the recorded history against the registered code: if an already-applied migration's implementation has changed, ``Migrations.apply()`` raises the new ``MigrationHistoryError`` and applies nothing; ``Migrations.verify(db)`` / ``Migrations.drift(db)`` run the same check read-only, and ``sqlite-utils migrate --list`` reports ``History problems``. Records written by hand or by older releases (which have no hash) are trusted and never rewritten, and records belonging to other migration sets are not examined or modified.
+- Non-transactional migrations (``transactional=False``) now commit a ``running`` record before executing and become ``applied`` on success. A migration function that accepts a second argument receives a new ``MigrationContext`` with ``done()``, ``complete()`` and ``step()`` methods for recording named, immediately-committed checkpoints, so an interrupted migration shows how far it got (``Migrations.interrupted(db)`` and the new ``Interrupted`` section of ``migrate --list``) and re-running converges without repeating completed steps. Checkpoints live in the new ``_sqlite_migration_checkpoints`` table.
+
 .. _v4_2_1:
 
 4.2.1 (2026-08-13)

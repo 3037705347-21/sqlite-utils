@@ -79,11 +79,7 @@ def test_basic(two_migrations, arg):
         return list_result.output
 
     assert _list() == (
-        "Migrations for: hello\n\n"
-        "  Applied:\n\n"
-        "  Pending:\n"
-        "    foo\n"
-        "    bar\n\n"
+        "Migrations for: hello\n\n  Applied:\n\n  Pending:\n    foo\n    bar\n\n"
     )
 
     result = runner.invoke(
@@ -128,7 +124,7 @@ def test_list_same_migration_names_in_different_sets(capsys):
 
     output = capsys.readouterr().out
     assert (
-        "Migrations for: pending\n\n" "  Applied:\n\n" "  Pending:\n" "    foo\n\n"
+        "Migrations for: pending\n\n  Applied:\n\n  Pending:\n    foo\n\n"
     ) in output
 
 
@@ -166,7 +162,9 @@ Schema before:
      "id" INTEGER PRIMARY KEY,
      "migration_set" TEXT,
      "name" TEXT,
-     "applied_at" TEXT
+     "applied_at" TEXT,
+     "content_hash" TEXT,
+     "status" TEXT
   );
   CREATE UNIQUE INDEX "idx__sqlite_migrations_migration_set_name"
       ON "_sqlite_migrations" ("migration_set", "name");
@@ -506,3 +504,153 @@ def test_list_with_legacy_class_is_read_only(tmpdir):
     db2 = sqlite_utils.Database(db_path)
     assert "_sqlite_migrations" not in db2.table_names()
     db2.close()
+
+
+MIGRATIONS_V1 = """
+from sqlite_utils import Migrations
+
+m = Migrations("hello")
+
+@m()
+def foo(db):
+    db.table("foo").insert({"hello": "world"})
+
+@m()
+def bar(db):
+    db.table("bar").insert({"hello": "world"})
+"""
+
+MIGRATIONS_V2_CHANGED_BAR = """
+from sqlite_utils import Migrations
+
+m = Migrations("hello")
+
+@m()
+def foo(db):
+    db.table("foo").insert({"hello": "world"})
+
+@m()
+def bar(db):
+    db.table("bar").insert({"hello": "CHANGED"})
+"""
+
+
+def test_rerun_unchanged_file_is_stable_across_processes(tmpdir):
+    # The content hash is recomputed by re-reading the migrations file on
+    # every invocation, so an unchanged file must not look like drift
+    path = pathlib.Path(tmpdir)
+    migrations_py = path / "migrations.py"
+    migrations_py.write_text(MIGRATIONS_V1, "utf-8")
+    db_path = str(path / "test.db")
+    runner = CliRunner()
+    first = runner.invoke(
+        sqlite_utils.cli.cli, ["migrate", db_path, str(migrations_py)]
+    )
+    assert first.exit_code == 0, first.output
+    second = runner.invoke(
+        sqlite_utils.cli.cli, ["migrate", db_path, str(migrations_py)]
+    )
+    assert second.exit_code == 0, second.output
+    # No rows were duplicated on the second run
+    db = sqlite_utils.Database(db_path)
+    assert len(list(db.table("foo").rows)) == 1
+    assert len(list(db.table("bar").rows)) == 1
+    db.close()
+
+
+def test_changed_applied_migration_file_errors(tmpdir):
+    path = pathlib.Path(tmpdir)
+    migrations_py = path / "migrations.py"
+    migrations_py.write_text(MIGRATIONS_V1, "utf-8")
+    db_path = str(path / "test.db")
+    runner = CliRunner()
+    result = runner.invoke(
+        sqlite_utils.cli.cli, ["migrate", db_path, str(migrations_py)]
+    )
+    assert result.exit_code == 0, result.output
+    # A merge changes bar's implementation under the same name
+    migrations_py.write_text(MIGRATIONS_V2_CHANGED_BAR, "utf-8")
+    result = runner.invoke(
+        sqlite_utils.cli.cli, ["migrate", db_path, str(migrations_py)]
+    )
+    assert result.exit_code == 1
+    assert "Migration history verification failed" in result.output
+    assert "bar" in result.output
+    # foo's code is unchanged, so it is never named in the error
+    assert "foo" not in result.output
+    # The old data is untouched and the new code never ran
+    db = sqlite_utils.Database(db_path)
+    assert [r["hello"] for r in db.table("bar").rows] == ["world"]
+    db.close()
+    # --list reports the same problem without modifying anything
+    listed = runner.invoke(
+        sqlite_utils.cli.cli, ["migrate", db_path, str(migrations_py), "--list"]
+    )
+    assert listed.exit_code == 0, listed.output
+    assert "History problems:" in listed.output
+    assert "bar: migration code has changed" in listed.output
+
+
+def test_interrupted_non_transactional_listed_and_resumed(tmpdir):
+    path = pathlib.Path(tmpdir)
+    migrations_py = path / "migrations.py"
+    marker = path / "succeed"
+    migrations_py.write_text(
+        f"""
+from sqlite_utils import Migrations
+
+m = Migrations("hello")
+
+@m(transactional=False)
+def bar(db, ctx):
+    if not ctx.done("one"):
+        db.table("bar_steps").insert({{"step": "one"}})
+        ctx.complete("one")
+    import pathlib
+    if not pathlib.Path({str(marker)!r}).exists():
+        raise RuntimeError("simulated interruption")
+    ctx.step("two", lambda: db.table("bar_steps").insert({{"step": "two"}}))
+""",
+        "utf-8",
+    )
+    db_path = str(path / "test.db")
+    runner = CliRunner()
+    first = runner.invoke(
+        sqlite_utils.cli.cli, ["migrate", db_path, str(migrations_py)]
+    )
+    assert first.exit_code == 1
+    assert isinstance(first.exception, RuntimeError)
+    assert "simulated interruption" in str(first.exception)
+
+    # The interruption and its progress are visible via --list
+    listed = runner.invoke(
+        sqlite_utils.cli.cli, ["migrate", db_path, str(migrations_py), "--list"]
+    )
+    assert listed.exit_code == 0, listed.output
+    assert "Interrupted:" in listed.output
+    assert "bar (will resume; steps completed: one)" in listed.output
+
+    # Mark the migration as able to finish, then re-run
+    marker.write_text("ok", "utf-8")
+    second = runner.invoke(
+        sqlite_utils.cli.cli, ["migrate", db_path, str(migrations_py)]
+    )
+    assert second.exit_code == 0, second.output
+    db = sqlite_utils.Database(db_path)
+    steps = [r["step"] for r in db.table("bar_steps").rows]
+    assert steps == ["one", "two"]
+    rows = list(
+        db.table("_sqlite_migrations").rows_where(
+            "migration_set = ? and name = ?", ["hello", "bar"]
+        )
+    )
+    assert rows[0]["status"] == "applied"
+    db.close()
+    # A third run converges - the steps are not repeated
+    third = runner.invoke(
+        sqlite_utils.cli.cli, ["migrate", db_path, str(migrations_py)]
+    )
+    assert third.exit_code == 0, third.output
+    db = sqlite_utils.Database(db_path)
+    assert [r["step"] for r in db.table("bar_steps").rows] == ["one", "two"]
+    db.close()
